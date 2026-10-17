@@ -1,0 +1,10 @@
+# Data processing
+pandas==2.2.3        # DataFrames and Excel reading
+openpyxl==3.1.5      # engine pandas uses for .xlsx files
+
+# Database
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10   # Postgres driver
+
+# Testing
+pytest==8.3.3
