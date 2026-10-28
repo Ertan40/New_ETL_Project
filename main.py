@@ -2,8 +2,10 @@ import pandas as pd
 from extract import read_customers_raw, read_orders_raw
 from clean import (clean_customers_structure, clean_customers_basic, remove_duplicate_customers,
                    map_countries_to_short, correct_vip_flag, clean_age, clean_signup_date, clean_phone,
-                   clean_orders_structure, remove_duplicate_orders)
-
+                   clean_orders_structure, remove_duplicate_orders, clean_orders_categories, clean_orders_quantity,
+                   clean_orders_date, clean_orders_amount, link_orders_to_customers)
+from messy_ETL_project.src.load import load_all
+from validate import validate
 
 # customers = pd.read_excel("C:/Users/ertan/PycharmProjects/python_web_scraping_demos/messy_ETL_project/data"
 #                           "/messy_training_data.xlsx",
@@ -24,6 +26,7 @@ print(raw["VIP?"].value_counts(dropna=False))
 
 # Layout rules (R01, R02): expect 71 -> 66
 customers = clean_customers_structure(raw)
+source_customers = len(customers)
 print(len(raw), "->", len(customers))
 
 # Duplicate emails, checked on the structurally cleaned data
@@ -55,9 +58,29 @@ print(customers[["customer_id", "signup_date", "phone"]].head(10))
 # orders:
 orders_raw = read_orders_raw()
 orders = clean_orders_structure(orders_raw)
-print("orders raw -> structure:", len(orders_raw), "->", len(orders))
+all_rejects = []
 
-orders, orders_rejected = remove_duplicate_orders(orders)
-print("after dedupe:", len(orders), "| rejected:", len(orders_rejected))
-print(orders_rejected[["source_row", "order_id", "reject_reason"]])
-print(orders["order_id"].is_unique, orders["customer_id"].isna().sum())
+orders, r = remove_duplicate_orders(orders);   all_rejects.append(r)
+orders, r = clean_orders_categories(orders);   all_rejects.append(r)
+orders, r = clean_orders_quantity(orders);     all_rejects.append(r)
+orders, r = clean_orders_date(orders);         all_rejects.append(r)
+orders, r = clean_orders_amount(orders);       all_rejects.append(r)
+orders, r = link_orders_to_customers(orders, customers, dup_map, rejected); all_rejects.append(r)
+
+orders_rejected = pd.concat(all_rejects, ignore_index=True)
+
+print("orders:", len(orders_raw), "=", len(orders), "loaded +", len(orders_rejected), "rejected")
+print(orders_rejected["reject_reason"].value_counts())
+print(orders.dtypes)
+print(orders["amount"].sum(), orders["quantity"].isna().sum())
+
+## ED: load all:
+load_all(customers, rejected, orders, orders_rejected)
+
+### ED: validate:
+ok = validate(customers, orders, rejected, orders_rejected,
+              source_customers=source_customers,
+              source_orders=len(orders_raw),
+              duplicates_removed=len(dup_map))
+if not ok:
+    raise SystemExit(1)    # non-zero exit code, so a scheduler would treat the run as failed

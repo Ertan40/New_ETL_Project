@@ -1,4 +1,5 @@
 import pandas as pd
+import re
 
 COLUMN_MAP = {
     "Cust ID": "customer_id",
@@ -36,6 +37,26 @@ ORDER_COLUMN_MAP = {
     "Qty": "quantity",
     "Status": "status",
     "Payment Method": "payment_method",
+}
+
+STATUS_MAP = {
+    "completed": "completed", "complete": "completed", "done": "completed",
+    "pending": "pending", "in progress": "pending",
+    "cancelled": "cancelled", "canceled": "cancelled",
+    "refunded": "refunded", "refund": "refunded",
+}
+
+CURRENCY_MAP = {
+    "eur": "EUR", "euro": "EUR",
+    "bgn": "BGN", "lv": "BGN",
+    "usd": "USD",
+}
+
+PAYMENT_MAP = {
+    "credit card": "credit_card", "cc": "credit_card", "card": "credit_card",
+    "paypal": "paypal",
+    "bank transfer": "bank_transfer", "wire": "bank_transfer",
+    "cash": "cash",
 }
 
 
@@ -176,6 +197,112 @@ def remove_duplicate_orders(df: pd.DataFrame):
 
     conflict = df.duplicated(subset="order_id", keep="first")  # same id, different content
     df, r = split_rejects(df, conflict, "conflicting duplicate order_id")
+    rejects.append(r)
+
+    return df.reset_index(drop=True), pd.concat(rejects, ignore_index=True)
+
+
+def clean_orders_categories(df: pd.DataFrame):
+    df = df.copy()
+    rejects = []
+
+    # status and currency are NOT NULL in the table, so unmapped values reject the row
+    for col, mapping, reason in [
+        ("status", STATUS_MAP, "missing or unknown status"),
+        ("currency", CURRENCY_MAP, "missing or unknown currency"),
+    ]:
+        mapped = df[col].str.strip().str.lower().map(mapping)
+        df, r = split_rejects(df, mapped.isna(), reason)   # reject rows still hold the raw value
+        rejects.append(r)
+        df[col] = mapped.loc[df.index]
+
+    # payment_method is optional: unmapped values become NULL
+    df["payment_method"] = df["payment_method"].str.strip().str.lower().map(PAYMENT_MAP)
+
+    return df.reset_index(drop=True), pd.concat(rejects, ignore_index=True)
+
+
+NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def clean_orders_quantity(df: pd.DataFrame):
+    df = df.copy()
+    raw = df["quantity"].str.strip().str.lower()
+    blank = raw.isna() | (raw == "")
+    num = pd.to_numeric(raw.replace(NUMBER_WORDS), errors="coerce")   # 'three' -> 3
+
+    invalid = ~blank & (num.isna() | (num < 1) | (num % 1 != 0))      # 0, negatives, 2.5, junk
+    df, rejected = split_rejects(df, invalid, "invalid quantity")
+    df["quantity"] = num.loc[df.index].astype("Int64")                # blank -> NULL
+    return df.reset_index(drop=True), rejected
+
+
+def clean_orders_date(df: pd.DataFrame, today=None):
+    df = df.copy()
+    today = pd.Timestamp(today) if today else pd.Timestamp.today().normalize()
+    parsed = parse_dates(df["order_date"])                            # reuses your date parser
+    rejects = []
+
+    df, r = split_rejects(df, parsed.isna(), "missing or invalid order date")
+    rejects.append(r)
+    df, r = split_rejects(df, parsed.loc[df.index] > today, "future order date")
+    rejects.append(r)
+
+    df["order_date"] = parsed.loc[df.index].dt.date
+    return df.reset_index(drop=True), pd.concat(rejects, ignore_index=True)
+
+
+def parse_amount(value):
+    if value is None or pd.isna(value):
+        return None
+    s = re.sub(r"[^0-9,.\-]", "", str(value))        # drop currency symbols, codes, spaces, words
+    if not re.search(r"\d", s):
+        return None                                  # 'free', 'N/A'
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):              # 1.234,50 -> decimal comma
+            s = s.replace(".", "").replace(",", ".")
+        else:                                        # 1,234.50 -> decimal dot
+            s = s.replace(",", "")
+    elif "," in s:
+        if re.search(r",\d{1,2}$", s):               # 119,92 -> decimal comma
+            s = s.replace(",", ".")
+        else:                                        # 1,234 -> thousands separator
+            s = s.replace(",", "")
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return None
+
+
+def clean_orders_amount(df: pd.DataFrame):
+    df = df.copy()
+    parsed = df["amount"].map(parse_amount).astype("float64")
+    rejects = []
+
+    df, r = split_rejects(df, parsed.isna(), "missing or unparseable amount")
+    rejects.append(r)
+    df, r = split_rejects(df, parsed.loc[df.index] <= 0, "zero or negative amount")
+    rejects.append(r)
+
+    df["amount"] = parsed.loc[df.index]
+    return df.reset_index(drop=True), pd.concat(rejects, ignore_index=True)
+
+
+def link_orders_to_customers(orders, customers, dup_map, customers_rejected):
+    orders = orders.copy()
+    repoint = dict(zip(dup_map["duplicate_id"], dup_map["kept_customer_id"]))
+    orders["customer_id"] = orders["customer_id"].replace(repoint)   # duplicate -> kept customer
+
+    rejects = []
+    df, r = split_rejects(orders, orders["customer_id"].isna(), "missing customer_id")
+    rejects.append(r)
+
+    rejected_ids = set(customers_rejected["customer_id"].dropna())
+    df, r = split_rejects(df, df["customer_id"].isin(rejected_ids), "customer was rejected")
+    rejects.append(r)
+
+    df, r = split_rejects(df, ~df["customer_id"].isin(set(customers["customer_id"])), "unknown customer")
     rejects.append(r)
 
     return df.reset_index(drop=True), pd.concat(rejects, ignore_index=True)
